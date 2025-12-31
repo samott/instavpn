@@ -177,7 +177,7 @@ func startSocksProxy(ctx context.Context, sshClient *ssh.Client) error {
 
 	go func() {
 		if err := server.Serve(ln); err != nil {
-			slog.Info("SOCKS server exited", err)
+			slog.Error("SOCKS server exited", "err", err)
 		}
 	}()
 
