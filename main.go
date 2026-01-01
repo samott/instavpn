@@ -26,6 +26,7 @@ const (
 	sshUser      = "ec2-user"
 	privateKey   = ""
 	socksAddr    = ""
+	vpcID        = ""
 )
 
 func main() {
@@ -43,7 +44,16 @@ func main() {
 
 	slog.Info("Launching EC2 instance...")
 
-	instanceId, ipAddr, err := launchInstance(ctx, ec2Client)
+	securityGroupId, err := createSecurityGroup(ctx, ec2Client, "0.0.0.0/0")
+
+	if err != nil {
+		slog.Error("Failed to create security group", "err", err)
+		os.Exit(1)
+	}
+
+	slog.Info("Created security group", "id", securityGroupId)
+
+	instanceId, ipAddr, err := launchInstance(ctx, ec2Client, securityGroupId)
 
 	if err != nil {
 		slog.Error("Failed to launch instance", "err", err)
@@ -51,13 +61,14 @@ func main() {
 	}
 
 	defer terminateInstance(context.Background(), ec2Client, instanceId)
+	defer deleteSecurityGroup(ctx, ec2Client, securityGroupId)
 
 	slog.Info("EC2 instance ready", "instanceId", instanceId, "ipAddr", ipAddr)
 
 	sshClient, err := connectSSH(ipAddr)
 
 	if err != nil {
-		slog.Error("Failed to create SSS tunnel", "err", err)
+		slog.Error("Failed to create SSH tunnel", "err", err)
 		terminateInstance(context.Background(), ec2Client, instanceId)
 		os.Exit(1)
 	}
@@ -71,13 +82,16 @@ func main() {
 	slog.Info("Shutting down...")
 }
 
-func launchInstance(ctx context.Context, ec2Client *ec2.Client) (string, string, error) {
+func launchInstance(ctx context.Context, ec2Client *ec2.Client, securityGroupId string) (string, string, error) {
 	runOut, err := ec2Client.RunInstances(ctx, &ec2.RunInstancesInput{
 		ImageId:      aws.String(amiID),
 		InstanceType: instanceType,
 		KeyName:      aws.String(keyPairName),
 		MinCount:     aws.Int32(1),
 		MaxCount:     aws.Int32(1),
+		SecurityGroupIds: []string{
+			securityGroupId,
+		},
 	})
 
 	if err != nil {
@@ -110,7 +124,7 @@ func launchInstance(ctx context.Context, ec2Client *ec2.Client) (string, string,
 }
 
 func terminateInstance(ctx context.Context, ec2Client *ec2.Client, instanceID string) {
-	fmt.Println("Terminating instance:", instanceID)
+	slog.Info("Terminating instance:", "id", instanceID)
 	_, err := ec2Client.TerminateInstances(ctx, &ec2.TerminateInstancesInput{
 		InstanceIds: []string{instanceID},
 	})
@@ -187,6 +201,69 @@ func startSocksProxy(ctx context.Context, sshClient *ssh.Client) error {
 	}()
 
 	return nil
+}
+
+func createSecurityGroup(
+	ctx context.Context,
+	ec2Client *ec2.Client,
+	sshCIDR string,
+) (string, error) {
+	slog.Info("Creating security group...")
+
+	// 1. Create the security group
+	sgOut, err := ec2Client.CreateSecurityGroup(ctx, &ec2.CreateSecurityGroupInput{
+		GroupName:   aws.String("instavpn"),
+		Description: aws.String("InstaVPN - Ephemeral SSH access"),
+		VpcId:       aws.String(vpcID),
+		TagSpecifications: []types.TagSpecification{
+			{
+				ResourceType: types.ResourceTypeSecurityGroup,
+				Tags: []types.Tag{
+					{Key: aws.String("Name"), Value: aws.String("instavpn")},
+					{Key: aws.String("CreatedBy"), Value: aws.String("instavpn")},
+					{Key: aws.String("Purpose"), Value: aws.String("SSH access")},
+					{Key: aws.String("TTL"), Value: aws.String("1h")},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+
+	sgID := *sgOut.GroupId
+
+	// 2. Allow inbound SSH
+	_, err = ec2Client.AuthorizeSecurityGroupIngress(ctx,
+		&ec2.AuthorizeSecurityGroupIngressInput{
+			GroupId: aws.String(sgID),
+			IpPermissions: []types.IpPermission{
+				{
+					IpProtocol: aws.String("tcp"),
+					FromPort:   aws.Int32(22),
+					ToPort:     aws.Int32(22),
+					IpRanges: []types.IpRange{
+						{CidrIp: aws.String(sshCIDR)},
+					},
+				},
+			},
+		})
+	if err != nil {
+		return "", err
+	}
+
+	return sgID, nil
+}
+
+func deleteSecurityGroup(ctx context.Context, ec2Client *ec2.Client, sgID string) {
+	slog.Info("Deleting security group...")
+
+	_, err := ec2Client.DeleteSecurityGroup(ctx, &ec2.DeleteSecurityGroupInput{
+		GroupId: aws.String(sgID),
+	})
+	if err != nil {
+		slog.Error("Error deleting security group", "err", err)
+	}
 }
 
 func waitForSignal() {
