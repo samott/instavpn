@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -42,7 +45,16 @@ func main() {
 
 	ec2Client := ec2.NewFromConfig(cfg)
 
-	securityGroupId, err := createSecurityGroup(ctx, ec2Client, "0.0.0.0/0")
+	myIp, err := getMyIp()
+
+	if err != nil {
+		slog.Error("Failed to look up my IP address", "err", err)
+		os.Exit(1)
+	}
+
+	slog.Info("Using my IP for firewall rule", "ip", myIp)
+
+	securityGroupId, err := createSecurityGroup(ctx, ec2Client, myIp+"/32")
 
 	if err != nil {
 		slog.Error("Failed to create security group", "err", err)
@@ -78,6 +90,21 @@ func main() {
 	waitForSignal()
 
 	slog.Info("Shutting down...")
+}
+
+func getMyIp() (string, error) {
+	resp, err := http.Get("https://checkip.amazonaws.com/")
+
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+
+	if err != nil {
+		return "", err
+	}
+
+	ip := strings.Trim(string(body), "\n")
+
+	return ip, nil
 }
 
 func launchInstance(ctx context.Context, ec2Client *ec2.Client, securityGroupId string) (string, string, error) {
