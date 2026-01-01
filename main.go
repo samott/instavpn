@@ -42,8 +42,6 @@ func main() {
 
 	ec2Client := ec2.NewFromConfig(cfg)
 
-	slog.Info("Launching EC2 instance...")
-
 	securityGroupId, err := createSecurityGroup(ctx, ec2Client, "0.0.0.0/0")
 
 	if err != nil {
@@ -60,8 +58,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	defer deleteSecurityGroup(ctx, ec2Client, instanceId, securityGroupId)
 	defer terminateInstance(context.Background(), ec2Client, instanceId)
-	defer deleteSecurityGroup(ctx, ec2Client, securityGroupId)
 
 	slog.Info("EC2 instance ready", "instanceId", instanceId, "ipAddr", ipAddr)
 
@@ -83,6 +81,8 @@ func main() {
 }
 
 func launchInstance(ctx context.Context, ec2Client *ec2.Client, securityGroupId string) (string, string, error) {
+	slog.Info("Launching EC2 instance...")
+
 	runOut, err := ec2Client.RunInstances(ctx, &ec2.RunInstancesInput{
 		ImageId:      aws.String(amiID),
 		InstanceType: instanceType,
@@ -231,12 +231,12 @@ func createSecurityGroup(
 		return "", err
 	}
 
-	sgID := *sgOut.GroupId
+	sgId := *sgOut.GroupId
 
 	// 2. Allow inbound SSH
 	_, err = ec2Client.AuthorizeSecurityGroupIngress(ctx,
 		&ec2.AuthorizeSecurityGroupIngressInput{
-			GroupId: aws.String(sgID),
+			GroupId: aws.String(sgId),
 			IpPermissions: []types.IpPermission{
 				{
 					IpProtocol: aws.String("tcp"),
@@ -252,15 +252,27 @@ func createSecurityGroup(
 		return "", err
 	}
 
-	return sgID, nil
+	return sgId, nil
 }
 
-func deleteSecurityGroup(ctx context.Context, ec2Client *ec2.Client, sgID string) {
+func deleteSecurityGroup(ctx context.Context, ec2Client *ec2.Client, instanceId, sgId string) {
+	slog.Info("Awaiting instance termination...")
+
+	waiter := ec2.NewInstanceTerminatedWaiter(ec2Client)
+	err := waiter.Wait(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceId},
+	}, 5*time.Minute)
+
+	if err != nil {
+		slog.Error("Error waiting for instance termination", "err", err)
+	}
+
 	slog.Info("Deleting security group...")
 
-	_, err := ec2Client.DeleteSecurityGroup(ctx, &ec2.DeleteSecurityGroupInput{
-		GroupId: aws.String(sgID),
+	_, err = ec2Client.DeleteSecurityGroup(ctx, &ec2.DeleteSecurityGroupInput{
+		GroupId: aws.String(sgId),
 	})
+
 	if err != nil {
 		slog.Error("Error deleting security group", "err", err)
 	}
